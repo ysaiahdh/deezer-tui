@@ -1,6 +1,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -155,6 +158,69 @@ struct StreamState {
     error: Option<String>,
 }
 
+/// Write all of `buf` at `offset`, leaving the file cursor untouched.
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    file.write_all_at(buf, offset)
+}
+
+/// Read exactly `buf.len()` bytes at `offset`, leaving the file cursor untouched.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    file.read_exact_at(buf, offset)
+}
+
+/// Write all of `buf` at `offset`, leaving the file cursor untouched.
+///
+/// Windows only exposes `seek_write`, which may transfer fewer bytes than
+/// asked for, so keep going until the whole buffer is on disk.
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes at `offset`, leaving the file cursor untouched.
+///
+/// Windows only exposes `seek_read`, which may return fewer bytes than asked
+/// for, so keep going until the whole buffer is filled.
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => {
+                offset += n as u64;
+                let (_, rest) = std::mem::take(&mut buf).split_at_mut(n);
+                buf = rest;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Create a file in the cache directory and unlink it straight away: it has no
 /// name, and the system frees it when the stream is dropped, even if the
 /// daemon crashes. The cache directory is used rather than `/tmp`, which is
@@ -168,11 +234,21 @@ fn anonymous_cache_file() -> io::Result<File> {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    // Windows cannot unlink a file that is still open. Ask the kernel to delete
+    // it when the last handle closes instead, which gives the same lifetime as
+    // the unnamed Unix file and still cleans up if the process crashes.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    let file = options.open(&path)?;
+    // Unix: unlink now so the file has no name and its space is freed when the
+    // handle is closed.
+    #[cfg(unix)]
     std::fs::remove_file(&path)?;
     Ok(file)
 }
@@ -195,7 +271,7 @@ impl StreamBuffer {
     fn append(&self, bytes: &[u8]) -> io::Result<usize> {
         // Only this (single) writer moves `len`, so it cannot change under us.
         let offset = self.len();
-        self.file.write_all_at(bytes, offset)?;
+        write_all_at(&self.file, bytes, offset)?;
         let len = {
             let mut st = self.state.lock().unwrap();
             st.len = offset + bytes.len() as u64;
@@ -305,7 +381,7 @@ impl Read for StreamReader {
             }
         };
         // Below `len`, the file is complete and never rewritten.
-        self.buf.file.read_exact_at(&mut out[..n], self.pos)?;
+        read_exact_at(&self.buf.file, &mut out[..n], self.pos)?;
         self.pos += n as u64;
         Ok(n)
     }

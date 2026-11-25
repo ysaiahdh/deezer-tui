@@ -33,3 +33,18 @@ libc = "0.2"
 # and desktop now-playing widgets control the daemon.
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = { version = "0.10", features = ["tokio"] }
+
+# System Media Transport Controls (Windows 10+). Same role as MPRIS on Linux:
+# media keys, the volume-flyout overlay and the "now playing" panel.
+# `windows` is used directly to create the hidden window SMTC needs and to
+# initialize the WinRT apartment (the daemon runs detached, without any window
+# of its own).
+[target.'cfg(target_os = "windows")'.dependencies]
+souvlaki = "0.7"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",           # WNDCLASSW (hbrBackground: HBRUSH)
+    "Win32_System_Com",             # CoInitializeEx / CoUninitialize (WinRT)
+    "Win32_System_LibraryLoader",   # GetModuleHandleW
+    "Win32_UI_WindowsAndMessaging", # hidden window + message pump
+] }

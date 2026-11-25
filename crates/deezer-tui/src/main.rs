@@ -7,6 +7,8 @@ mod i18n;
 mod mpris;
 mod protocol;
 mod release_notes;
+#[cfg(target_os = "windows")]
+mod smtc;
 mod terminal_text;
 mod theme;
 mod ui;
@@ -17,7 +19,7 @@ use std::fs;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-use crate::protocol::{send_line, socket_path, Command};
+use crate::protocol::{connect_sync, send_line, Command};
 use crate::terminal_text::sanitize;
 
 /// Initialize file-based logging (no-op if RUST_LOG is not set).
@@ -34,6 +36,14 @@ fn init_logging(path: &str) {
                 .try_init();
         }
     }
+}
+
+/// Path of a log file in the app cache directory, falling back to the system
+/// temp directory. Avoids hard-coding POSIX `/tmp` paths.
+fn log_file(name: &str) -> String {
+    let dir = deezer_core::Config::cache_dir().unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(name).to_string_lossy().into_owned()
 }
 
 fn print_help() {
@@ -99,6 +109,17 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "-v" || a == "--version") {
         print_version();
         return Ok(());
+    }
+
+    // Internal: run only the daemon. On Windows the TUI spawns itself with
+    // this flag to get a background daemon (there is no fork()).
+    if args.iter().any(|a| a == "--daemon") {
+        init_logging(&log_file("deezer-daemon.log"));
+        let rt = build_daemon_runtime()?;
+        return rt.block_on(async {
+            let mut d = daemon::Daemon::new()?;
+            d.run().await
+        });
     }
 
     // Shell completions generator
@@ -286,24 +307,27 @@ fn main() -> Result<()> {
     let show_updated = args.iter().any(|a| a == "--updated");
 
     // Try to connect to an existing daemon
-    let sock_path = socket_path();
-    if try_connect_sync(&sock_path) {
+    if connect_sync() {
         // Daemon is running — launch as client
-        init_logging("/tmp/deezer-tui.log");
+        init_logging(&log_file("deezer-tui.log"));
         let rt = build_client_runtime()?;
         rt.block_on(async {
             let mut client = client::Client::connect().await?;
             client.run(show_updated).await
         })
     } else {
-        // No daemon running — fork: child becomes daemon, parent becomes client
+        // No daemon running — start one, then run as client.
         #[cfg(unix)]
         {
             start_with_fork(show_updated)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // On non-Unix, just run daemon in-process (no background support)
+            start_with_daemon(show_updated)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // No background-process support: run the daemon in-process.
             let rt = build_daemon_runtime()?;
             rt.block_on(async {
                 let mut d = daemon::Daemon::new()?;
@@ -335,17 +359,12 @@ fn build_daemon_runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Fetch a single snapshot from the daemon (if alive).
 fn fetch_daemon_snapshot() -> Result<Option<crate::protocol::DaemonSnapshot>> {
-    let sock_path = socket_path();
-    if !sock_path.exists() {
-        return Ok(None);
-    }
-
     let rt = build_client_runtime()?;
     rt.block_on(async {
         use crate::protocol::read_line;
-        match tokio::net::UnixStream::connect(&sock_path).await {
+        match crate::protocol::connect().await {
             Ok(stream) => {
-                let (read_half, _write_half) = stream.into_split();
+                let (read_half, _write_half) = tokio::io::split(stream);
                 let mut reader = tokio::io::BufReader::new(read_half);
                 let snap = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -452,15 +471,9 @@ fn handle_status(json: bool) -> Result<()> {
 
 /// Send a single command to the daemon and exit.
 fn send_command_to_daemon(cmd: Command) -> Result<()> {
-    let sock_path = socket_path();
-    if !sock_path.exists() {
-        eprintln!("deezer-tui: no daemon running");
-        return Ok(());
-    }
-
     let rt = build_client_runtime()?;
     rt.block_on(async {
-        match tokio::net::UnixStream::connect(&sock_path).await {
+        match crate::protocol::connect().await {
             Ok(mut stream) => {
                 if let Err(e) = send_line(&mut stream, &cmd).await {
                     eprintln!("deezer-tui: failed to send command: {e}");
@@ -476,16 +489,10 @@ fn send_command_to_daemon(cmd: Command) -> Result<()> {
 
 /// Handle `deezer-tui -q` / `--quit`: connect to daemon and send shutdown.
 fn handle_quit() -> Result<()> {
-    let sock_path = socket_path();
-    if !sock_path.exists() {
-        eprintln!("deezer-tui: no daemon running");
-        return Ok(());
-    }
-
     let rt = build_client_runtime()?;
     rt.block_on(async {
         use tokio::io::AsyncReadExt;
-        match tokio::net::UnixStream::connect(&sock_path).await {
+        match crate::protocol::connect().await {
             Ok(mut stream) => {
                 if let Err(e) = send_line(&mut stream, &Command::Shutdown).await {
                     eprintln!("deezer-tui: failed to send shutdown: {e}");
@@ -513,31 +520,51 @@ fn handle_quit() -> Result<()> {
     })
 }
 
-/// Check if we can connect to the daemon socket (synchronous).
-fn try_connect_sync(sock_path: &std::path::Path) -> bool {
-    if !sock_path.exists() {
-        return false;
-    }
-    // Try a synchronous connect to check if daemon is alive
-    match std::os::unix::net::UnixStream::connect(sock_path) {
-        Ok(_stream) => {
-            // Connected — daemon is alive.
-            // Drop the stream immediately (we'll reconnect async).
-            true
+/// Windows: spawn a background daemon process, wait for its named pipe, then
+/// run this process as the TUI client.
+#[cfg(windows)]
+fn start_with_daemon(show_updated: bool) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    /// Don't inherit the console: the daemon runs without a window.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let exe = std::env::current_exe()?;
+    ProcessCommand::new(exe)
+        .arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()?;
+
+    // Wait for the daemon to create its pipe (up to 3 seconds).
+    let mut ready = false;
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if connect_sync() {
+            ready = true;
+            break;
         }
-        Err(_) => {
-            // Stale socket file — clean up
-            let _ = std::fs::remove_file(sock_path);
-            false
-        }
     }
+    if !ready {
+        anyhow::bail!("Daemon failed to start (pipe not available)");
+    }
+
+    init_logging(&log_file("deezer-tui.log"));
+    let rt = build_client_runtime()?;
+    rt.block_on(async {
+        let mut client = client::Client::connect().await?;
+        client.run(show_updated).await
+    })
 }
 
 /// Fork: child becomes daemon, parent waits then launches as client.
 #[cfg(unix)]
 fn start_with_fork(show_updated: bool) -> Result<()> {
-    let sock_path = socket_path();
-
     match unsafe { libc::fork() } {
         -1 => {
             anyhow::bail!("fork() failed");
@@ -556,7 +583,7 @@ fn start_with_fork(show_updated: bool) -> Result<()> {
             }
 
             // Initialize daemon logging to its own file (after fork)
-            init_logging("/tmp/deezer-daemon.log");
+            init_logging(&log_file("deezer-daemon.log"));
 
             // Build tokio runtime AFTER fork (no inherited threads)
             let rt = build_daemon_runtime()?;
@@ -577,17 +604,17 @@ fn start_with_fork(show_updated: bool) -> Result<()> {
         }
         _child_pid => {
             // === PARENT: wait for daemon socket, then run as client ===
-            init_logging("/tmp/deezer-tui.log");
+            init_logging(&log_file("deezer-tui.log"));
 
             // Wait for the daemon to start listening (up to 3 seconds)
             for _ in 0..60 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if sock_path.exists() && try_connect_sync(&sock_path) {
+                if connect_sync() {
                     break;
                 }
             }
 
-            if !try_connect_sync(&sock_path) {
+            if !connect_sync() {
                 anyhow::bail!("Daemon failed to start (socket not available)");
             }
 

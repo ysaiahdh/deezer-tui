@@ -7,6 +7,8 @@ use super::models::{
     SimilarArtistEntry, TrackData,
 };
 use super::DeezerClient;
+use crate::config::SortOrder;
+use crate::sort;
 
 const GW_LIGHT_URL: &str = "https://www.deezer.com/ajax/gw-light.php";
 const AUTH_JWT_URL: &str = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
@@ -185,8 +187,20 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse search results: {e}")))
     }
 
-    /// Get the user's favorite (loved) tracks.
+    /// Get the user's favorite (loved) tracks, most recently added first.
     pub async fn get_favorites(&self) -> Result<Vec<TrackData>, DeezerError> {
+        self.get_favorites_ordered(SortOrder::DateDesc).await
+    }
+
+    /// Get the user's favorite (loved) tracks in `order`.
+    ///
+    /// `favorite_song.getList` takes no ordering parameter and answers
+    /// oldest-added first, so the order is applied in memory from the
+    /// `DATE_ADD` every entry carries.
+    pub async fn get_favorites_ordered(
+        &self,
+        order: SortOrder,
+    ) -> Result<Vec<TrackData>, DeezerError> {
         let session = self
             .session
             .as_ref()
@@ -204,8 +218,10 @@ impl DeezerClient {
             .get("data")
             .ok_or_else(|| DeezerError::Api("Missing 'data' in favorites response".into()))?;
 
-        serde_json::from_value(data.clone())
-            .map_err(|e| DeezerError::Api(format!("Failed to parse favorites: {e}")))
+        let mut tracks: Vec<TrackData> = serde_json::from_value(data.clone())
+            .map_err(|e| DeezerError::Api(format!("Failed to parse favorites: {e}")))?;
+        sort::tracks_by_date(&mut tracks, order);
+        Ok(tracks)
     }
 
     /// Search and return results as DisplayItems for a specific category.

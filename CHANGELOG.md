@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Windows: media keys, the volume overlay and the "now playing" panel control playback
+
 ## [1.21.0] - 2026-10-22
 
 ### Changed

@@ -1,8 +1,10 @@
+use std::io;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use deezer_core::api::models::{
     AlbumDetail, ArtistDetail, ArtistSubTab, AudioQuality, DisplayItem, GenreDetail, PlaylistData,
@@ -623,22 +625,246 @@ impl Default for DaemonSnapshot {
     }
 }
 
-/// Get the Unix socket path for daemon IPC.
+/// Address of the daemon's IPC endpoint.
+///
+/// Unix uses a socket file in the config directory. Windows has no Unix-domain
+/// sockets in Tokio, so the daemon listens on a named pipe scoped to the
+/// current user.
 pub fn socket_path() -> PathBuf {
-    deezer_core::Config::dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("daemon.sock")
+    #[cfg(unix)]
+    {
+        deezer_core::Config::dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("daemon.sock")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\deezer-tui-{}", pipe_user()))
+    }
 }
 
-/// Get the PID file path for the daemon process.
+/// Path of the daemon PID file (used to stop a stuck daemon on update).
 pub fn pid_path() -> PathBuf {
     deezer_core::Config::dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join("daemon.pid")
 }
 
-/// Send a line-delimited JSON message over a Unix stream.
-pub async fn send_line<T: Serialize>(stream: &mut UnixStream, msg: &T) -> std::io::Result<()> {
+/// Windows user name, restricted to characters that are safe in a pipe name.
+#[cfg(windows)]
+fn pipe_user() -> String {
+    let raw = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "default".to_string());
+    let safe: String = raw
+        .chars()
+        .take(128)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    }
+}
+
+/// Client end of the daemon connection.
+#[cfg(unix)]
+pub type ClientStream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Server end of a daemon connection.
+#[cfg(unix)]
+pub type ServerStream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type ServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+pub type ClientWriteHalf = tokio::io::WriteHalf<ClientStream>;
+pub type ServerWriteHalf = tokio::io::WriteHalf<ServerStream>;
+
+/// Windows error returned while every pipe instance is serving a client.
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Connect to the daemon.
+pub async fn connect() -> io::Result<ClientStream> {
+    connect_at(socket_path()).await
+}
+
+async fn connect_at(path: PathBuf) -> io::Result<ClientStream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(path).await
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        // `ERROR_PIPE_BUSY` means the daemon is alive but every instance is
+        // taken: wait for one to come free instead of reporting it as down.
+        for _ in 0..40 {
+            match ClientOptions::new().open(&path) {
+                Ok(client) => return Ok(client),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon pipe stayed busy",
+        ))
+    }
+}
+
+/// Synchronous liveness probe used before starting the daemon.
+pub fn connect_sync() -> bool {
+    connect_sync_at(socket_path())
+}
+
+fn connect_sync_at(path: PathBuf) -> bool {
+    #[cfg(unix)]
+    {
+        if !path.exists() {
+            return false;
+        }
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(_stream) => true,
+            Err(_) => {
+                // Stale socket file — clean it up so a fresh daemon can bind.
+                let _ = std::fs::remove_file(&path);
+                false
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        for _ in 0..20 {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(_stream) => return true,
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+}
+
+/// Listening end of the daemon IPC channel.
+pub struct IpcListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(windows)]
+    path: PathBuf,
+    #[cfg(windows)]
+    pending: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+}
+
+impl IpcListener {
+    /// Bind the IPC endpoint, replacing a stale Unix socket file if needed.
+    pub async fn bind() -> io::Result<Self> {
+        Self::bind_at(socket_path()).await
+    }
+
+    async fn bind_at(path: PathBuf) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(Self {
+                inner: tokio::net::UnixListener::bind(&path)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let pending = new_pipe_instance(&path, true)?;
+            Ok(Self {
+                path,
+                pending: Some(pending),
+            })
+        }
+    }
+
+    /// Wait for the next client and hand back the connected stream.
+    pub async fn accept(&mut self) -> io::Result<ServerStream> {
+        #[cfg(unix)]
+        {
+            let (stream, _addr) = self.inner.accept().await?;
+            Ok(stream)
+        }
+        #[cfg(windows)]
+        {
+            if self.pending.is_none() {
+                self.pending = Some(new_pipe_instance(&self.path, false)?);
+            }
+
+            // Await on the instance already stored in `self`: this future is
+            // polled inside `select!` and may be cancelled at any await point,
+            // so it must not take the instance out before the handshake ends.
+            let connected = self
+                .pending
+                .as_ref()
+                .expect("instance created above")
+                .connect()
+                .await;
+
+            if let Err(e) = connected {
+                // The client vanished mid-handshake, so this instance is dead.
+                // Recreate the pending slot right away to keep the pipe name
+                // available; if recreation fails, leave it empty so the next
+                // `accept` retries instead of reusing a dead handle.
+                self.pending = new_pipe_instance(&self.path, false).ok();
+                return Err(e);
+            }
+
+            let connected = self.pending.take().expect("instance existed");
+            // Create the next instance before returning, so another client can
+            // connect while this one is being served.
+            self.pending = Some(new_pipe_instance(&self.path, false)?);
+            Ok(connected)
+        }
+    }
+}
+
+/// Create one instance of the daemon's named pipe.
+#[cfg(windows)]
+fn new_pipe_instance(
+    path: &std::path::Path,
+    first: bool,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut options = ServerOptions::new();
+    // The first instance claims the name: if it already exists, another daemon
+    // is running and binding must fail.
+    options.first_pipe_instance(first);
+    options.create(path)
+}
+
+/// Send a line-delimited JSON message over any async stream.
+pub async fn send_line<W, T>(stream: &mut W, msg: &T) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let mut json = serde_json::to_string(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     json.push('\n');
@@ -658,4 +884,100 @@ pub async fn read_line<T: for<'de> Deserialize<'de>, R: tokio::io::AsyncRead + U
     let msg = serde_json::from_str(&line)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique endpoint per test run, so a real daemon (or a parallel test) is
+    /// never disturbed.
+    fn test_endpoint() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        #[cfg(unix)]
+        {
+            std::env::temp_dir().join(format!("deezer-tui-test-{pid}-{n}.sock"))
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"\\.\pipe\deezer-tui-test-{pid}-{n}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_roundtrip_and_second_client() {
+        let path = test_endpoint();
+        let mut listener = IpcListener::bind_at(path.clone()).await.unwrap();
+
+        let first_path = path.clone();
+        let first = tokio::spawn(async move {
+            let mut stream = connect_at(first_path).await.unwrap();
+            send_line(&mut stream, &"ping".to_string()).await.unwrap();
+        });
+
+        let stream = listener.accept().await.unwrap();
+        let (read_half, _write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let got: Option<String> = read_line(&mut reader).await.unwrap();
+        assert_eq!(got.as_deref(), Some("ping"));
+        first.await.unwrap();
+
+        // A second client must also get through: the listener creates a fresh
+        // pipe instance / keeps accepting after every connection.
+        let second_path = path.clone();
+        let second = tokio::spawn(async move {
+            let mut stream = connect_at(second_path).await.unwrap();
+            send_line(&mut stream, &"pong".to_string()).await.unwrap();
+        });
+
+        let stream = listener.accept().await.unwrap();
+        let (read_half, _write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let got: Option<String> = read_line(&mut reader).await.unwrap();
+        assert_eq!(got.as_deref(), Some("pong"));
+        second.await.unwrap();
+
+        drop(listener);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ipc_sync_probe_reports_liveness_without_breaking_accept() {
+        let path = test_endpoint();
+        let mut listener = IpcListener::bind_at(path.clone()).await.unwrap();
+
+        // The launcher's synchronous probe must detect the live endpoint.
+        assert!(connect_sync_at(path.clone()));
+
+        // On Windows the probe is a real client connection: accepting it hands
+        // back a peer that is already gone. The listener must survive that and
+        // still serve the next client.
+        drop(listener.accept().await.unwrap());
+
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            let mut stream = connect_at(client_path).await.unwrap();
+            send_line(&mut stream, &"after-probe".to_string())
+                .await
+                .unwrap();
+        });
+
+        let stream = listener.accept().await.unwrap();
+        let (read_half, _write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        let got: Option<String> = read_line(&mut reader).await.unwrap();
+        assert_eq!(got.as_deref(), Some("after-probe"));
+        client.await.unwrap();
+
+        drop(listener);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        // Nothing listening anymore: the probe reports "no daemon".
+        assert!(!connect_sync_at(path));
+    }
 }

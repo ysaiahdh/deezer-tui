@@ -109,7 +109,7 @@ fn parse_arl(input: &str) -> Option<String> {
 /// Generate a unique temp file path for receiving the ARL.
 fn temp_auth_file_path() -> PathBuf {
     let pid = std::process::id();
-    PathBuf::from(format!("/tmp/deezer-tui-auth-{pid}"))
+    std::env::temp_dir().join(format!("deezer-tui-auth-{pid}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -304,6 +304,23 @@ fn setup_uri_handler(_auth_file: &Path) -> Result<Option<String>> {
 #[cfg(target_os = "macos")]
 fn cleanup_uri_handler(_old_handler: Option<&str>) {}
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn setup_uri_handler(_auth_file: &Path) -> Result<Option<String>> {
+    // No URI-scheme registration here; the manual paste fallback is used.
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cleanup_uri_handler(_old_handler: Option<&str>) {}
+
+#[cfg(windows)]
+fn open_browser(url: &str) -> Result<()> {
+    // `start` treats its first argument as the window title, hence the "".
+    Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let browsers: &[&str] = &["open"];
@@ -329,39 +346,53 @@ fn open_browser(url: &str) -> Result<()> {
     anyhow::bail!("No browser found")
 }
 
-/// Check if stdin has data available (non-blocking).
-fn stdin_has_data() -> bool {
-    use std::os::unix::io::AsRawFd;
-    let fd = io::stdin().as_raw_fd();
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut pollfd, 1, 0) > 0 }
-}
+/// Drain keyboard input that arrived since the last check into `buf`.
+///
+/// Reads through crossterm's event source instead of `libc::poll`/`libc::read`
+/// on stdin: crossterm already owns terminal input for the TUI, so this is
+/// portable and does not leave a second reader competing with it once the TUI
+/// resumes.
+fn drain_stdin(buf: &mut Vec<u8>) -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-/// Read available bytes from stdin without blocking.
-/// Uses raw `libc::read` to avoid interfering with Rust's internal stdin buffer,
-/// which would conflict with crossterm's event reader after we resume the TUI.
-fn read_stdin_nonblocking(buf: &mut Vec<u8>) -> usize {
-    use std::os::unix::io::AsRawFd;
-    let fd = io::stdin().as_raw_fd();
-    let mut tmp = [0u8; 4096];
-    let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
-    if n > 0 {
-        buf.extend_from_slice(&tmp[..n as usize]);
-        n as usize
-    } else {
-        0
+    let mut got = false;
+    // `poll(ZERO)` only reports whether an event is queued; drain everything so
+    // a pasted ARL is handled in a single pass.
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let Ok(ev) = event::read() else { break };
+        got = true;
+        if let Event::Key(key) = ev {
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char(c) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        // Ctrl+C / Ctrl+D cancel, like an empty line.
+                        if matches!(c, 'c' | 'C' | 'd' | 'D') {
+                            buf.push(b'\n');
+                        }
+                        continue;
+                    }
+                    let mut tmp = [0u8; 4];
+                    buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                }
+                KeyCode::Enter => buf.push(b'\n'),
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                _ => {}
+            }
+        }
     }
+    got
 }
 
 /// Wait for ARL from either the auth file (URI handler) or stdin (manual paste).
 /// Returns `None` on timeout or cancellation (empty input / Ctrl+D).
 ///
-/// Uses non-blocking stdin reads via `libc::poll`/`libc::read` to avoid spawning
-/// threads that would linger and steal input from crossterm after the TUI resumes.
+/// Input is polled non-blockingly through crossterm, so no thread is spawned
+/// that would linger and steal input from the TUI after it resumes.
 fn wait_for_arl(auth_file: &Path) -> Option<String> {
     let start = Instant::now();
     let mut stdin_buf = Vec::new();
@@ -384,9 +415,7 @@ fn wait_for_arl(auth_file: &Path) -> Option<String> {
         }
 
         // Check stdin non-blockingly (manual paste fallback)
-        if stdin_has_data() {
-            read_stdin_nonblocking(&mut stdin_buf);
-
+        if drain_stdin(&mut stdin_buf) {
             // Process complete lines
             while let Some(newline_pos) = stdin_buf.iter().position(|&b| b == b'\n') {
                 let line = String::from_utf8_lossy(&stdin_buf[..newline_pos]).to_string();

@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::io::BufReader;
-use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
 use deezer_core::api::models::{
@@ -23,8 +22,8 @@ use crate::favorites_cache::FavoritesCache;
 use crate::i18n::t;
 use crate::protocol::{
     pid_path, read_line, socket_path, ActiveTab, Command, DaemonSnapshot, ExploreCategory,
-    FavoritesCategory, GenreItem, MoodEntry, OfflineCategory, RadioItem, Screen, SearchCategory,
-    ServerMessage,
+    FavoritesCategory, GenreItem, IpcListener, MoodEntry, OfflineCategory, RadioItem, Screen,
+    SearchCategory, ServerMessage, ServerWriteHalf,
 };
 use deezer_core::api::models::GenreDetail;
 
@@ -310,6 +309,11 @@ pub struct Daemon {
     mpris: Option<mpris_server::Server<crate::mpris::MprisHandler>>,
     #[cfg(target_os = "linux")]
     mpris_last: crate::mpris::MprisSnapshot,
+
+    // System Media Transport Controls (Windows). Same role as MPRIS on Linux.
+    // `None` if SMTC/WinRT is unavailable.
+    #[cfg(target_os = "windows")]
+    smtc: Option<crate::smtc::SmtcServer>,
 }
 
 impl Daemon {
@@ -342,7 +346,13 @@ impl Daemon {
             deezer_core::player::stream::new_cdn_client().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (async_tx, async_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let favorites_cache = FavoritesCache::load();
+        let mut favorites_cache = FavoritesCache::load();
+        // A cache written by an older build is stored in API order (oldest
+        // added first); re-apply the configured order so the first Favorites
+        // screen after an upgrade already matches the web player.
+        if let Some(tracks) = favorites_cache.tracks.as_mut() {
+            deezer_core::sort::tracks_by_date(tracks, config.sort_order);
+        }
         let cached_moods = favorites_cache.moods.clone().unwrap_or_default();
         let favorite_track_ids = favorites_cache
             .tracks
@@ -448,6 +458,9 @@ impl Daemon {
             mpris: None,
             #[cfg(target_os = "linux")]
             mpris_last: crate::mpris::MprisSnapshot::default(),
+
+            #[cfg(target_os = "windows")]
+            smtc: None,
         })
     }
 
@@ -455,15 +468,9 @@ impl Daemon {
     pub async fn run(&mut self) -> Result<()> {
         let sock_path = socket_path();
 
-        // Clean up stale socket
-        if sock_path.exists() {
-            let _ = std::fs::remove_file(&sock_path);
-        }
-        if let Some(parent) = sock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let listener = UnixListener::bind(&sock_path)?;
+        // Unix: replaces a stale socket file. Windows: claims the named pipe,
+        // which also fails if another daemon already owns it.
+        let mut listener = IpcListener::bind().await?;
         info!(?sock_path, "Daemon listening");
 
         // Write PID file so the client can kill us during updates
@@ -489,20 +496,18 @@ impl Daemon {
         // Main daemon loop — supports multiple concurrent clients.
         // Each client has a spawned reader task that pushes commands into a channel.
         // Writers are kept in a shared map; snapshots are broadcast to all clients.
-        type ClientWriters = Arc<
-            tokio::sync::Mutex<
-                HashMap<u64, Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
-            >,
-        >;
+        type ClientWriters =
+            Arc<tokio::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<ServerWriteHalf>>>>>;
         let clients: ClientWriters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let mut next_client_id: u64 = 0;
         let (client_cmd_tx, mut client_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<(u64, Option<Command>)>();
 
-        // Register the MPRIS D-Bus media player (Linux desktops). Commands from
-        // media keys / now-playing widgets arrive on `mpris_cmd_rx` and are fed
-        // through the normal command path below. On non-Linux the sender is
-        // dropped immediately so the receiver branch stays dormant.
+        // Register the OS media controls: MPRIS D-Bus on Linux, SMTC on
+        // Windows. Commands from media keys / now-playing widgets arrive on
+        // `mpris_cmd_rx` and are fed through the normal command path below.
+        // On other platforms the sender is dropped immediately so the
+        // receiver branch stays dormant.
         let (mpris_cmd_tx, mut mpris_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
         #[cfg(target_os = "linux")]
         {
@@ -518,7 +523,19 @@ impl Daemon {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            match crate::smtc::SmtcServer::new(mpris_cmd_tx) {
+                Ok(server) => {
+                    info!("System Media Transport Controls registered");
+                    self.smtc = Some(server);
+                }
+                Err(e) => {
+                    warn!("SMTC unavailable: {e}");
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         drop(mpris_cmd_tx);
 
         loop {
@@ -529,12 +546,12 @@ impl Daemon {
                 // Accept new client connection
                 accept_result = listener.accept() => {
                     match accept_result {
-                        Ok((stream, _addr)) => {
+                        Ok(stream) => {
                             let id = next_client_id;
                             next_client_id += 1;
                             info!(client_id = id, "Client connected");
 
-                            let (read_half, write_half) = stream.into_split();
+                            let (read_half, write_half) = tokio::io::split(stream);
                             let writer = Arc::new(tokio::sync::Mutex::new(write_half));
 
                             // Register the client BEFORE any I/O so one-shot commands
@@ -572,6 +589,9 @@ impl Daemon {
                         }
                         Err(e) => {
                             error!("Accept error: {e}");
+                            // Don't spin (and flood the log) if accept keeps
+                            // failing, e.g. while the pipe is being recreated.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -601,9 +621,10 @@ impl Daemon {
                     }
                 }
 
-                // Command received from the MPRIS D-Bus interface (media keys, etc.)
+                // Command received from the OS media controls (MPRIS on Linux,
+                // SMTC on Windows): media keys, now-playing widgets, etc.
                 Some(command) = mpris_cmd_rx.recv() => {
-                    debug!(?command, "Received MPRIS command");
+                    debug!(?command, "Received media control command");
                     let should_shutdown = matches!(command, Command::Shutdown);
                     self.handle_command(command);
 
@@ -612,7 +633,7 @@ impl Daemon {
                     self.mpris_refresh().await;
 
                     if should_shutdown {
-                        info!("Shutdown requested via MPRIS, exiting daemon");
+                        info!("Shutdown requested via media controls, exiting daemon");
                         break;
                     }
                 }
@@ -1527,10 +1548,11 @@ impl Daemon {
         self.favorites_loading = true;
         let client = Arc::clone(&self.client);
         let tx = self.async_tx.clone();
+        let order = self.config.sort_order;
 
         tokio::spawn(async move {
             let client = client.lock().await;
-            match client.get_favorites().await {
+            match client.get_favorites_ordered(order).await {
                 Ok(tracks) => {
                     let _ = tx.send(AsyncResult::FavoritesLoaded(
                         FavoritesCategory::Tracks,
@@ -1613,9 +1635,10 @@ impl Daemon {
 
         match category {
             FavoritesCategory::Tracks => {
+                let order = self.config.sort_order;
                 tokio::spawn(async move {
                     let client = client.lock().await;
-                    match client.get_favorites().await {
+                    match client.get_favorites_ordered(order).await {
                         Ok(tracks) => {
                             let _ = tx.send(AsyncResult::FavoritesLoaded(category, tracks));
                         }
@@ -4056,7 +4079,21 @@ impl Daemon {
         self.mpris = Some(server);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Push the player state to the Windows System Media Transport Controls so
+    /// media keys and the now-playing panel stay in sync. No-op if SMTC failed
+    /// to register.
+    #[cfg(target_os = "windows")]
+    async fn mpris_refresh(&mut self) {
+        let state = match self.player_state.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Some(smtc) = self.smtc.as_mut() {
+            smtc.refresh(&state);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     async fn mpris_refresh(&mut self) {}
 
     /// Report the current track to Deezer's `log.listen` endpoint once we've
@@ -4115,7 +4152,7 @@ impl Daemon {
 
 /// Send a line-delimited JSON message over a write half.
 async fn send_line_writer<T: serde::Serialize>(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut ServerWriteHalf,
     msg: &T,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -4129,9 +4166,7 @@ async fn send_line_writer<T: serde::Serialize>(
 /// Broadcast a snapshot to every connected client. Serializes once, writes to all.
 /// Dead clients (write errors) are removed from the map.
 async fn broadcast_snapshot(
-    clients: &Arc<
-        tokio::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>>,
-    >,
+    clients: &Arc<tokio::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<ServerWriteHalf>>>>>,
     snap: DaemonSnapshot,
 ) {
     let msg = ServerMessage::Snapshot(snap);
@@ -4143,10 +4178,7 @@ async fn broadcast_snapshot(
     let bytes = json.into_bytes();
 
     // Collect writers outside the map lock to avoid holding it during I/O.
-    let writers: Vec<(
-        u64,
-        Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    )> = {
+    let writers: Vec<(u64, Arc<tokio::sync::Mutex<ServerWriteHalf>>)> = {
         let g = clients.lock().await;
         g.iter().map(|(k, v)| (*k, v.clone())).collect()
     };

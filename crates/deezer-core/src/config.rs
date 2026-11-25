@@ -31,9 +31,56 @@ pub struct Config {
     /// Enable vim-style navigation keys (h, j, k, l). Disabled by default.
     #[serde(default)]
     pub vim_keys: bool,
+    /// Default track order in the Favorites and Playlist views: `"date_desc"`
+    /// (newest first, the default), `"date_asc"`, or `"api"` for the order the
+    /// API returned (a playlist's own order).
+    #[serde(default, deserialize_with = "deserialize_sort_order")]
+    pub sort_order: SortOrder,
     /// Graphic equalizer settings (disabled by default).
     #[serde(default)]
     pub equalizer: EqSettings,
+}
+
+/// Display order of a track list.
+///
+/// `DATE_ADD` is what Deezer's web player sorts favourites on; playlists have
+/// their own order, which is what the API returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    /// Most recently added first.
+    #[default]
+    DateDesc,
+    /// Oldest first.
+    DateAsc,
+    /// Leave the order the API sent.
+    Api,
+}
+
+impl SortOrder {
+    /// Value used in `config.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DateDesc => "date_desc",
+            Self::DateAsc => "date_asc",
+            Self::Api => "api",
+        }
+    }
+}
+
+/// Read `sort_order` leniently: an unknown or malformed value falls back to the
+/// default instead of failing the whole config parse, which would make `load`
+/// return a default config and the next save drop the stored ARL.
+fn deserialize_sort_order<'de, D>(deserializer: D) -> Result<SortOrder, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        Some("date_asc") => SortOrder::DateAsc,
+        Some("api") => SortOrder::Api,
+        _ => SortOrder::DateDesc,
+    })
 }
 
 fn default_quality() -> AudioQuality {
@@ -55,6 +102,7 @@ impl Default for Config {
             skip_update_check: false,
             bg_transparency: 0,
             vim_keys: false,
+            sort_order: SortOrder::default(),
             equalizer: EqSettings::default(),
         }
     }
@@ -200,5 +248,48 @@ mod tests {
         assert_eq!(files, ["config.json"]);
         assert_eq!(Config::load_from(&path).arl.as_deref(), Some("arl"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn sort_order_defaults_to_newest_first_and_round_trips() {
+        // A config written by an older build has no `sort_order` key: it must
+        // load as the new default rather than failing or picking `Api`.
+        let path = temp_config("sort-order");
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(&path, r#"{"volume":0.5}"#).unwrap();
+
+        let config = Config::load_from(&path);
+        assert_eq!(config.sort_order, SortOrder::DateDesc);
+        assert_eq!(config.sort_order.as_str(), "date_desc");
+
+        for (text, expected) in [
+            ("\"date_desc\"", SortOrder::DateDesc),
+            ("\"date_asc\"", SortOrder::DateAsc),
+            ("\"api\"", SortOrder::Api),
+        ] {
+            fs::write(&path, format!(r#"{{"sort_order":{text}}}"#)).unwrap();
+            assert_eq!(Config::load_from(&path).sort_order, expected);
+        }
+
+        // Unknown values fall back to the default instead of refusing to start,
+        // and do not cost the rest of the config (the ARL cannot be re-derived).
+        fs::write(
+            &path,
+            r#"{"arl":"secret","sort_order":"sideways","volume":0.25}"#,
+        )
+        .unwrap();
+        let config = Config::load_from(&path);
+        assert_eq!(config.sort_order, SortOrder::DateDesc);
+        assert_eq!(config.arl.as_deref(), Some("secret"));
+        assert_eq!(config.volume, 0.25);
+
+        // Nor does a value of the wrong JSON type.
+        fs::write(&path, r#"{"arl":"secret","sort_order":true}"#).unwrap();
+        let config = Config::load_from(&path);
+        assert_eq!(config.sort_order, SortOrder::DateDesc);
+        assert_eq!(config.arl.as_deref(), Some("secret"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -20,7 +20,6 @@ use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -31,15 +30,16 @@ use deezer_core::api::models::{
 use deezer_core::config::Config;
 use deezer_core::player::eq::{EqPreset, EqSettings, EQ_BAND_COUNT};
 use deezer_core::player::state::{PlaybackStatus, RepeatMode};
+use deezer_core::SortOrder;
 
 use crate::i18n::{self, t, Locale};
 use crate::release_notes::{self, NoteLine};
 use deezer_core::offline::OfflineTrack;
 
 use crate::protocol::{
-    pid_path, read_line, socket_path, ActiveTab, Command, DaemonSnapshot, ExploreCategory,
-    FavoritesCategory, GenreDetailSubTab, GenreItem, MoodEntry, NavOverlay, OfflineCategory,
-    RadioItem, Screen, SearchCategory, ServerMessage,
+    connect, connect_sync, pid_path, read_line, ActiveTab, ClientWriteHalf, Command,
+    DaemonSnapshot, ExploreCategory, FavoritesCategory, GenreDetailSubTab, GenreItem, MoodEntry,
+    NavOverlay, OfflineCategory, RadioItem, Screen, SearchCategory, ServerMessage,
 };
 use crate::terminal_text::sanitize;
 use crate::theme::{Theme, ThemeId};
@@ -728,6 +728,8 @@ pub enum PlaylistSort {
     Default,
     /// Most recently added first (`DATE_ADD`).
     RecentlyAdded,
+    /// Oldest added first.
+    OldestAdded,
     Title,
     Artist,
     Album,
@@ -738,11 +740,21 @@ impl PlaylistSort {
     pub fn next(self) -> Self {
         match self {
             Self::Default => Self::RecentlyAdded,
-            Self::RecentlyAdded => Self::Title,
+            Self::RecentlyAdded => Self::OldestAdded,
+            Self::OldestAdded => Self::Title,
             Self::Title => Self::Artist,
             Self::Artist => Self::Album,
             Self::Album => Self::Duration,
             Self::Duration => Self::Default,
+        }
+    }
+
+    /// Sort a playlist opens with, from `config.json`'s `sort_order`.
+    pub fn from_config(order: SortOrder) -> Self {
+        match order {
+            SortOrder::DateDesc => Self::RecentlyAdded,
+            SortOrder::DateAsc => Self::OldestAdded,
+            SortOrder::Api => Self::Default,
         }
     }
 
@@ -751,6 +763,7 @@ impl PlaylistSort {
         match self {
             Self::Default => s.sort_default,
             Self::RecentlyAdded => s.sort_recently_added,
+            Self::OldestAdded => s.sort_oldest_added,
             Self::Title => s.sort_title,
             Self::Artist => s.sort_artist,
             Self::Album => s.sort_album,
@@ -771,6 +784,8 @@ impl PlaylistSort {
             // in for a playlist that was never reordered by hand.
             Self::RecentlyAdded if tracks.iter().all(|t| t.date_add == 0) => order.reverse(),
             Self::RecentlyAdded => order.sort_by_key(|&i| std::cmp::Reverse(tracks[i].date_add)),
+            // Ascending already matches the playlist order when undated.
+            Self::OldestAdded => order.sort_by_key(|&i| tracks[i].date_add),
             Self::Title => {
                 order.sort_by_cached_key(|&i| (key(i, |t| &t.title), key(i, |t| &t.artist)))
             }
@@ -865,6 +880,8 @@ pub struct ViewState {
     pub playlist_detail_filter_typing: bool,
     /// Display order of the playlist detail modal (`o`). Client-only.
     pub playlist_detail_sort: PlaylistSort,
+    /// Sort a playlist opens with, from `config.json`'s `sort_order`.
+    pub default_playlist_sort: PlaylistSort,
     /// "What's new" shown in the info modal after an upgrade; empty otherwise.
     pub release_notes: Vec<NoteLine>,
     pub genre_detail: Option<GenreDetail>,
@@ -979,6 +996,8 @@ pub(crate) fn fuzzy_match(query: &str, target: &str) -> bool {
 
 impl ViewState {
     fn from_snapshot(snap: &DaemonSnapshot) -> Self {
+        let config = Config::load();
+        let default_playlist_sort = PlaylistSort::from_config(config.sort_order);
         Self {
             screen: snap.screen,
             active_tab: snap.active_tab,
@@ -1056,7 +1075,8 @@ impl ViewState {
             playlist_detail_loading: snap.playlist_detail_loading,
             playlist_detail_filter_input: String::new(),
             playlist_detail_filter_typing: false,
-            playlist_detail_sort: PlaylistSort::Default,
+            playlist_detail_sort: default_playlist_sort,
+            default_playlist_sort,
             release_notes: Vec::new(),
             genre_detail: snap.genre_detail.clone(),
             genre_detail_loading: snap.genre_detail_loading,
@@ -1066,7 +1086,7 @@ impl ViewState {
             login_loading: snap.login_loading,
             user_name: snap.user_name.clone(),
             is_offline: snap.is_offline,
-            vim_keys: Config::load().vim_keys,
+            vim_keys: config.vim_keys,
 
             offline_filter_input: String::new(),
             offline_filter_typing: false,
@@ -1329,11 +1349,12 @@ impl ViewState {
     }
 
     /// Clear the playlist detail modal's track filter and sort (on open /
-    /// re-open).
+    /// re-open). The sort returns to the configured default, so a re-opened
+    /// playlist shows the same order as a freshly started TUI.
     pub fn reset_playlist_detail_filter(&mut self) {
         self.playlist_detail_filter_input.clear();
         self.playlist_detail_filter_typing = false;
-        self.playlist_detail_sort = PlaylistSort::Default;
+        self.playlist_detail_sort = self.default_playlist_sort;
     }
 
     /// Leave every text input: the mouse moved the focus somewhere else.
@@ -1876,7 +1897,7 @@ pub struct Client {
     /// stream. Reading to completion in its own task and forwarding results
     /// over this channel avoids that entirely.
     server_rx: mpsc::UnboundedReceiver<io::Result<ServerMessage>>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    writer: ClientWriteHalf,
     picker: Picker,
     image_tx: mpsc::UnboundedSender<(String, image::DynamicImage)>,
     image_rx: mpsc::UnboundedReceiver<(String, image::DynamicImage)>,
@@ -1925,9 +1946,8 @@ pub fn restore_terminal() {
 
 impl Client {
     pub async fn connect() -> Result<Self> {
-        let path = socket_path();
-        let stream = UnixStream::connect(&path).await?;
-        let (read_half, write_half) = stream.into_split();
+        let stream = connect().await?;
+        let (read_half, write_half) = tokio::io::split(stream);
 
         // Detect terminal graphics protocol (must happen before alternate screen)
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
@@ -5621,10 +5641,22 @@ fn version_is_newer(remote: &str, current: &str) -> bool {
     parse(remote) > parse(current)
 }
 
+/// Signal a daemon that outlived its shutdown grace period.
+#[cfg(unix)]
+fn terminate_daemon_after_grace(iterations: usize, pid: Option<u32>) {
+    if iterations == 10 {
+        if let Some(pid) = pid {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_daemon_after_grace(_iterations: usize, _pid: Option<u32>) {}
+
 /// Wait for the daemon to fully exit before launching the new binary.
 /// Sends SIGTERM if the daemon is still alive after a grace period.
 async fn wait_for_daemon_exit() {
-    let sock = socket_path();
     let pid_file = pid_path();
 
     // Read daemon PID for fallback kill
@@ -5632,27 +5664,24 @@ async fn wait_for_daemon_exit() {
         .ok()
         .and_then(|s| s.trim().parse().ok());
 
-    // Poll until socket disappears (daemon cleaned up) — up to 3 seconds
+    // Poll until the IPC endpoint stops accepting connections — up to 3 seconds.
     for i in 0..30 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if !sock.exists() {
+        if !connect_sync() {
             return; // daemon exited cleanly
         }
         // After 1s with no clean exit, send SIGTERM to be sure
-        #[cfg(unix)]
-        if i == 10 {
-            if let Some(pid) = daemon_pid {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-            }
-        }
+        terminate_daemon_after_grace(i, daemon_pid);
     }
 
     // Last resort: SIGKILL and remove stale files manually
     #[cfg(unix)]
-    if let Some(pid) = daemon_pid {
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    {
+        if let Some(pid) = daemon_pid {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(crate::protocol::socket_path());
     }
-    let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&pid_file);
 }
 
@@ -5715,7 +5744,7 @@ async fn perform_update(download_url: &str) -> Result<std::path::PathBuf> {
     }
 
     let bytes = resp.bytes().await?;
-    let tmp_path = std::path::PathBuf::from("/tmp/deezer-tui-update.tmp");
+    let tmp_path = std::env::temp_dir().join("deezer-tui-update.tmp");
 
     // Write to temp file
     {
@@ -5905,6 +5934,10 @@ mod tests {
         }
 
         let mut view = ViewState::from_snapshot(&DaemonSnapshot::default());
+        // The default sort comes from the machine's config.json; pin it here so
+        // the indices below are the playlist's own.
+        view.default_playlist_sort = PlaylistSort::Default;
+        view.playlist_detail_sort = PlaylistSort::Default;
         view.playlist_detail = Some(PlaylistDetail {
             playlist_id: "1".into(),
             title: "Mix".into(),
@@ -5967,6 +6000,7 @@ mod tests {
 
         assert_eq!(PlaylistSort::Default.order(&tracks), [0, 1, 2, 3]);
         assert_eq!(PlaylistSort::RecentlyAdded.order(&tracks), [3, 0, 2, 1]);
+        assert_eq!(PlaylistSort::OldestAdded.order(&tracks), [1, 2, 0, 3]);
         assert_eq!(PlaylistSort::Title.order(&tracks), [1, 0, 3, 2]);
         // Case-insensitive; same artist grouped by album, then playlist order.
         assert_eq!(PlaylistSort::Artist.order(&tracks), [1, 3, 2, 0]);
@@ -5982,13 +6016,38 @@ mod tests {
             })
             .collect();
         assert_eq!(PlaylistSort::RecentlyAdded.order(&undated), [3, 2, 1, 0]);
+        // Ascending already matches the playlist order: nothing moves.
+        assert_eq!(PlaylistSort::OldestAdded.order(&undated), [0, 1, 2, 3]);
 
         // The cycle visits every mode and comes back.
         let mut sort = PlaylistSort::Default;
-        for _ in 0..6 {
+        for _ in 0..7 {
             sort = sort.next();
         }
         assert_eq!(sort, PlaylistSort::Default);
+    }
+
+    #[test]
+    fn playlist_opens_in_the_configured_sort_order() {
+        assert_eq!(
+            PlaylistSort::from_config(SortOrder::DateDesc),
+            PlaylistSort::RecentlyAdded
+        );
+        assert_eq!(
+            PlaylistSort::from_config(SortOrder::DateAsc),
+            PlaylistSort::OldestAdded
+        );
+        assert_eq!(
+            PlaylistSort::from_config(SortOrder::Api),
+            PlaylistSort::Default
+        );
+
+        // The default config opens playlists newest-first, like the Favorites
+        // tab and Deezer's web player.
+        assert_eq!(
+            PlaylistSort::from_config(SortOrder::default()),
+            PlaylistSort::RecentlyAdded
+        );
     }
 
     #[test]
@@ -6002,6 +6061,9 @@ mod tests {
             .unwrap()
         }
         let mut view = ViewState::from_snapshot(&DaemonSnapshot::default());
+        // The default sort comes from the machine's config.json; pin it here.
+        view.default_playlist_sort = PlaylistSort::Default;
+        view.playlist_detail_sort = PlaylistSort::Default;
         view.playlist_detail = Some(PlaylistDetail {
             playlist_id: "1".into(),
             title: "Mix".into(),
@@ -6044,9 +6106,9 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // Re-opening resets both.
+        // Re-opening resets both: the sort returns to the configured default.
         view.reset_playlist_detail_filter();
-        assert_eq!(view.playlist_detail_sort, PlaylistSort::Default);
+        assert_eq!(view.playlist_detail_sort, view.default_playlist_sort);
         assert!(view.playlist_detail_filter_input.is_empty());
     }
 
