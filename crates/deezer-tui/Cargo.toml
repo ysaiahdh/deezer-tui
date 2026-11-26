@@ -46,5 +46,6 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",           # WNDCLASSW (hbrBackground: HBRUSH)
     "Win32_System_Com",             # CoInitializeEx / CoUninitialize (WinRT)
     "Win32_System_LibraryLoader",   # GetModuleHandleW
+    "Win32_UI_Shell",               # SetCurrentProcessExplicitAppUserModelID
     "Win32_UI_WindowsAndMessaging", # hidden window + message pump
 ] }

@@ -28,6 +28,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW,
     TranslateMessage, UnregisterClassW, HMENU, MSG, PM_REMOVE, WINDOW_EX_STYLE, WNDCLASSW,
@@ -48,6 +49,26 @@ const SEEK_STEP_SECS: u64 = 5;
 /// A `&str` as a NUL-terminated UTF-16 buffer for the `...W` Win32 APIs.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// AppUserModelID under which Windows files this process.
+///
+/// Without an explicit ID, the detached daemon is grouped under a generic
+/// executable-derived identity and the "now playing" panel cannot match it to
+/// the installed Deezer app. Deezer's own desktop client ID is tried first, so
+/// the daemon shows up next to it; the private ID is only a fallback.
+const APP_USER_MODEL_ID: &str = "com.deezer.deezer-desktop";
+const FALLBACK_APP_USER_MODEL_ID: &str = "Deezer.TUI";
+
+/// Set the process AppUserModelID, best effort: a failure only means the
+/// default identity is kept, which is not a reason to lose media controls.
+fn set_app_user_model_id() {
+    for id in [APP_USER_MODEL_ID, FALLBACK_APP_USER_MODEL_ID] {
+        let id = wide(id);
+        if unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(id.as_ptr())) }.is_ok() {
+            return;
+        }
+    }
 }
 
 /// Build cover-art URL from a Deezer `ALB_PICTURE` md5 hash.
@@ -139,6 +160,11 @@ impl SmtcServer {
     /// Returns an error if WinRT or SMTC are unavailable (e.g. an old Windows
     /// build); the daemon then simply runs without OS media controls.
     pub fn new(cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>) -> Result<Self> {
+        // Identity first: it must be set before any WinRT/COM object is
+        // created, otherwise the toast/now-playing activation context is
+        // already bound to the default identity.
+        set_app_user_model_id();
+
         // WinRT needs an initialized COM apartment on this thread. MTA lets
         // SMTC deliver its callbacks on a free-threaded RPC thread, so the
         // daemon does not need a UI message loop to receive them.
