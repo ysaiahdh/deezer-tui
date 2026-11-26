@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Windows: media keys, the volume overlay and the "now playing" panel control playback
+- Favorites added on another device (web player or mobile app) now appear in the TUI automatically; `R` forces an immediate refresh of the current favorites list
 
 ## [1.21.0] - 2026-10-22
 

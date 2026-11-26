@@ -3002,6 +3002,14 @@ impl Client {
                 KeyAction::Continue
             }
 
+            // Refresh the current favorites category from Deezer
+            KeyCode::Char('R') => {
+                if self.view.active_tab == ActiveTab::Favorites {
+                    return KeyAction::SendCommand(Command::RefreshFavorites);
+                }
+                KeyAction::Continue
+            }
+
             // Deezer Flow
             KeyCode::Char('f') => KeyAction::SendCommand(Command::StartFlow),
 

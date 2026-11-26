@@ -274,6 +274,7 @@ PlayerEngine stays on daemon's main thread (rodio/cpal are `!Send`). Audio fetch
 | `?` | Show shortcuts help |
 | `f` | Start Deezer Flow |
 | `g` | Shuffle play favorites |
+| `R` | Refresh current favorites list from Deezer |
 | `Ctrl+O` | Open settings (themes) |
 | `Ctrl+F` | Search / filter mode (same as `/`) |
 | `q` | Quit (sends Shutdown to daemon) |

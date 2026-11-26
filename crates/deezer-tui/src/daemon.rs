@@ -38,6 +38,39 @@ const SEEK_SAFETY_MARGIN_SECS: u64 = 5;
 /// current one is safe.
 const PREFETCH_MIN_AHEAD_SECS: f64 = 20.0;
 
+/// Why a favorites category is being fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FavoritesFetch {
+    /// Nothing usable on screen yet: blank the list, show the loading state.
+    Foreground,
+    /// A list is already displayed: swap it in only if it actually changed,
+    /// without disturbing the selection or the status line.
+    Background,
+    /// Refresh key: like `Background`, but reports the outcome.
+    Manual,
+}
+
+impl FavoritesFetch {
+    /// Whether the fetch may replace or blank what the user is looking at.
+    fn is_foreground(self) -> bool {
+        matches!(self, Self::Foreground)
+    }
+}
+
+/// Order-sensitive fingerprint of a favorite-tracks list, used to tell a
+/// background revalidation that found something new from a no-op. It includes
+/// the title so a reissued/renamed track counts as a change too.
+fn track_signature(tracks: &[TrackData]) -> String {
+    let mut signature = String::new();
+    for track in tracks {
+        signature.push_str(&track.track_id);
+        signature.push('\u{1f}');
+        signature.push_str(&track.title);
+        signature.push('\u{1f}');
+    }
+    signature
+}
+
 /// Async results from background tasks.
 enum AsyncResult {
     LoginSuccess(String),
@@ -48,11 +81,24 @@ enum AsyncResult {
     SearchError(String),
     SearchDisplayResults(Vec<DisplayItem>),
     /// Tracks for a favorites category. Carries the category the request was
-    /// issued for so a late response cannot be attributed to another one.
-    FavoritesLoaded(FavoritesCategory, Vec<TrackData>),
-    FavoritesError(FavoritesCategory, String),
+    /// issued for so a late response cannot be attributed to another one, and
+    /// how it was triggered (see [`FavoritesFetch`]).
+    FavoritesLoaded {
+        category: FavoritesCategory,
+        tracks: Vec<TrackData>,
+        mode: FavoritesFetch,
+    },
+    FavoritesError {
+        category: FavoritesCategory,
+        err: String,
+        mode: FavoritesFetch,
+    },
     /// Display items for a favorites category (see `FavoritesLoaded`).
-    FavoritesDisplayLoaded(FavoritesCategory, Vec<DisplayItem>),
+    FavoritesDisplayLoaded {
+        category: FavoritesCategory,
+        items: Vec<DisplayItem>,
+        mode: FavoritesFetch,
+    },
     TrackReady {
         audio_data: AudioInput,
         track: TrackData,
@@ -78,7 +124,10 @@ enum AsyncResult {
     FavoriteAlbumRemoved(String),
     FavoriteAlbumError(String),
     FavoriteIdsLoaded {
-        track_ids: Vec<String>,
+        /// Favorite tracks, straight from the API: they seed the tracks cache
+        /// and the heart indicators at login. Not optional — a failed request
+        /// sends no result at all, so an error can never clear the hearts.
+        tracks: Vec<TrackData>,
         artist_ids: Vec<String>,
         album_ids: Vec<String>,
     },
@@ -207,6 +256,9 @@ pub struct Daemon {
     favorite_artist_ids: Vec<String>,
     favorite_album_ids: Vec<String>,
     favorites_cache: FavoritesCache,
+    /// Category with a background (re)validation in flight. Keeps repeated tab
+    /// switches from piling up identical requests while one is unanswered.
+    favorites_revalidating: Option<FavoritesCategory>,
 
     // Explore tab
     explore_category: ExploreCategory,
@@ -390,6 +442,7 @@ impl Daemon {
             favorite_artist_ids: Vec::new(),
             favorite_album_ids: Vec::new(),
             favorites_cache,
+            favorites_revalidating: None,
 
             offline_index: OfflineIndex::load(),
             offline_category: OfflineCategory::default(),
@@ -641,6 +694,7 @@ impl Daemon {
                 // Tick: update position, auto-advance, process async results
                 _ = tick => {
                     self.process_async_results();
+                    self.revalidate_stale_favorites();
                     self.on_tick();
 
                     // Broadcast periodic snapshot to all clients
@@ -923,8 +977,8 @@ impl Daemon {
                     RepeatMode::Track => RepeatMode::Off,
                 };
             }
-            Command::LoadFavorites => {
-                self.start_load_favorites();
+            Command::RefreshFavorites => {
+                self.refresh_favorites_category();
             }
             Command::SelectUp => {
                 let sel = self.selection_mut();
@@ -1540,36 +1594,40 @@ impl Daemon {
         }
     }
 
+    /// Reload the favorite tracks — the list behind the heart indicators —
+    /// after an in-app add/remove. Reports in the status line only when the
+    /// Tracks category is the one on display.
     fn start_load_favorites(&mut self) {
         if self.is_offline {
             self.status_msg = Some(t().no_internet.into());
             return;
         }
-        self.favorites_loading = true;
-        let client = Arc::clone(&self.client);
-        let tx = self.async_tx.clone();
-        let order = self.config.sort_order;
-
-        tokio::spawn(async move {
-            let client = client.lock().await;
-            match client.get_favorites_ordered(order).await {
-                Ok(tracks) => {
-                    let _ = tx.send(AsyncResult::FavoritesLoaded(
-                        FavoritesCategory::Tracks,
-                        tracks,
-                    ));
-                }
-                Err(e) => {
-                    let _ = tx.send(AsyncResult::FavoritesError(
-                        FavoritesCategory::Tracks,
-                        e.to_string(),
-                    ));
-                }
-            }
-        });
+        let mode = if self.favorites_category == FavoritesCategory::Tracks {
+            FavoritesFetch::Foreground
+        } else {
+            FavoritesFetch::Background
+        };
+        self.fetch_favorites_category(FavoritesCategory::Tracks, mode);
     }
 
+    /// Load the current favorites category: the cached copy is shown at once
+    /// and revalidated in the background once it is old enough.
     fn start_load_favorites_category(&mut self) {
+        self.load_favorites_category(false);
+    }
+
+    /// Refresh key: bypass the cache and fetch the current category now.
+    fn refresh_favorites_category(&mut self) {
+        // Stale-mark first so a failed refresh is retried by the next load
+        // instead of being served as fresh — the data itself stays on disk
+        // until the new list arrives.
+        if let Some(section) = Self::cache_section(self.favorites_category) {
+            self.favorites_cache.mark_stale(section);
+        }
+        self.load_favorites_category(true);
+    }
+
+    fn load_favorites_category(&mut self, force: bool) {
         if self.is_offline {
             self.status_msg = Some(t().no_internet.into());
             return;
@@ -1577,59 +1635,223 @@ impl Daemon {
 
         let category = self.favorites_category;
 
-        // ── Cache hit: serve immediately without a network call ──────────
-        match category {
-            FavoritesCategory::Tracks => {
-                if let Some(tracks) = self.favorites_cache.tracks.clone() {
-                    self.favorites_display = tracks.iter().map(DisplayItem::from_track).collect();
-                    self.favorites = tracks;
-                    self.favorites_selected = 0;
-                    self.favorites_loading = false;
-                    return;
-                }
+        if !force {
+            // ── Cache hit: served immediately, no network call ──────────
+            if self.show_cached_favorites(category) {
+                self.favorites_loading = false;
+                self.revalidate_favorites_category();
+                return;
             }
-            FavoritesCategory::Artists => {
-                if let Some(items) = self.favorites_cache.artists.clone() {
-                    self.favorites.clear();
-                    self.favorites_display = items;
-                    self.favorites_selected = 0;
-                    self.favorites_loading = false;
-                    return;
-                }
-            }
-            FavoritesCategory::Albums => {
-                if let Some(items) = self.favorites_cache.albums.clone() {
-                    self.favorites.clear();
-                    self.favorites_display = items;
-                    self.favorites_selected = 0;
-                    self.favorites_loading = false;
-                    return;
-                }
-            }
-            FavoritesCategory::Playlists => {
-                if let Some(items) = self.favorites_cache.playlists.clone() {
-                    self.favorites.clear();
-                    self.favorites_display = items;
-                    self.favorites_selected = 0;
-                    self.favorites_loading = false;
-                    return;
-                }
-            }
-            FavoritesCategory::Following => {
-                if let Some(items) = self.favorites_cache.following.clone() {
-                    self.favorites.clear();
-                    self.favorites_display = items;
-                    self.favorites_selected = 0;
-                    self.favorites_loading = false;
-                    return;
-                }
-            }
-            // RecentlyPlayed is never cached (changes after every play)
-            FavoritesCategory::RecentlyPlayed => {}
         }
 
-        // ── Cache miss: fetch from API ───────────────────────────────────
-        self.favorites_loading = true;
+        // ── Cache miss (or forced refresh): go to the API ───────────────
+        let mode = if force {
+            FavoritesFetch::Manual
+        } else {
+            FavoritesFetch::Foreground
+        };
+        self.fetch_favorites_category(category, mode);
+    }
+
+    /// Revalidate the current category in the background when its cached copy
+    /// is older than the cache TTL. Favorites can also be added from the web
+    /// player or the mobile app, which this process never hears about.
+    fn revalidate_favorites_category(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        let category = self.favorites_category;
+        let Some(section) = Self::cache_section(category) else {
+            return;
+        };
+        // One request at a time per category: tab switching must not pile up.
+        if self.favorites_revalidating == Some(category) {
+            return;
+        }
+        if self.favorites_cache.needs_revalidation(section) {
+            self.fetch_favorites_category(category, FavoritesFetch::Background);
+        }
+    }
+
+    /// Revalidate every cached favorites section in the background once it is
+    /// older than the cache TTL. Runs on each tick so a list that goes stale
+    /// while the user stays on one tab still catches up with changes made from
+    /// the web player or the mobile app.
+    fn revalidate_stale_favorites(&mut self) {
+        if self.is_offline || self.screen != Screen::Main {
+            return;
+        }
+        for (section, category) in [
+            (FavoritesCache::TRACKS, FavoritesCategory::Tracks),
+            (FavoritesCache::ARTISTS, FavoritesCategory::Artists),
+            (FavoritesCache::ALBUMS, FavoritesCategory::Albums),
+            (FavoritesCache::PLAYLISTS, FavoritesCategory::Playlists),
+            (FavoritesCache::FOLLOWING, FavoritesCategory::Following),
+        ] {
+            // One request at a time per category: ticks must not pile up.
+            if self.favorites_revalidating == Some(category) {
+                continue;
+            }
+            if self.favorites_cache.needs_revalidation(section) {
+                self.fetch_favorites_category(category, FavoritesFetch::Background);
+            }
+        }
+    }
+
+    /// Cache section backing a category, `None` for the ones never cached
+    /// (Recently Played changes after every track play).
+    fn cache_section(category: FavoritesCategory) -> Option<&'static str> {
+        match category {
+            FavoritesCategory::Tracks => Some(FavoritesCache::TRACKS),
+            FavoritesCategory::Artists => Some(FavoritesCache::ARTISTS),
+            FavoritesCategory::Albums => Some(FavoritesCache::ALBUMS),
+            FavoritesCategory::Playlists => Some(FavoritesCache::PLAYLISTS),
+            FavoritesCategory::Following => Some(FavoritesCache::FOLLOWING),
+            FavoritesCategory::RecentlyPlayed => None,
+        }
+    }
+
+    /// Show the cached copy of `category`, if there is one. Returns whether
+    /// anything was displayed.
+    fn show_cached_favorites(&mut self, category: FavoritesCategory) -> bool {
+        match category {
+            FavoritesCategory::Tracks => {
+                let Some(tracks) = self.favorites_cache.tracks.clone() else {
+                    return false;
+                };
+                self.show_favorite_tracks(tracks, false);
+                true
+            }
+            FavoritesCategory::RecentlyPlayed => false,
+            _ => {
+                let Some(section) = Self::cache_section(category) else {
+                    return false;
+                };
+                let Some(items) = self.favorites_cache.display_items(section) else {
+                    return false;
+                };
+                let items = items.to_vec();
+                self.show_favorite_items(items, false);
+                true
+            }
+        }
+    }
+
+    /// Display `tracks` in the Favorites tab. `keep_selection` keeps the
+    /// focused row where it is (clamped) instead of jumping back to the top.
+    fn show_favorite_tracks(&mut self, tracks: Vec<TrackData>, keep_selection: bool) {
+        let selected = if keep_selection {
+            self.favorites_selected
+        } else {
+            0
+        };
+        self.favorites_display = tracks.iter().map(DisplayItem::from_track).collect();
+        self.favorites_selected = selected.min(self.favorites_display.len().saturating_sub(1));
+        self.favorites = tracks;
+    }
+
+    /// Display non-track favorites items (see `show_favorite_tracks`).
+    fn show_favorite_items(&mut self, items: Vec<DisplayItem>, keep_selection: bool) {
+        let selected = if keep_selection {
+            self.favorites_selected
+        } else {
+            0
+        };
+        self.favorites.clear();
+        self.favorites_selected = selected.min(items.len().saturating_sub(1));
+        self.favorites_display = items;
+    }
+
+    /// Install a freshly fetched favorite-tracks list: cache, on-disk file,
+    /// heart-indicator ids and — when that category is the one displayed — the
+    /// tab itself.
+    fn apply_favorite_tracks(&mut self, tracks: Vec<TrackData>, mode: FavoritesFetch) {
+        let changed = self.store_favorite_tracks(&tracks);
+        if self.favorites_category != FavoritesCategory::Tracks {
+            return;
+        }
+        match mode {
+            FavoritesFetch::Foreground | FavoritesFetch::Manual => {
+                self.favorites_loading = false;
+                self.status_msg = Some(t().fmt_loaded(tracks.len()));
+                self.show_favorite_tracks(tracks, !mode.is_foreground());
+            }
+            // A revalidation that found nothing new must not disturb the view.
+            FavoritesFetch::Background => {
+                if changed {
+                    self.show_favorite_tracks(tracks, true);
+                }
+            }
+        }
+    }
+
+    /// Store freshly fetched favorite tracks, returning whether the list
+    /// actually changed.
+    fn store_favorite_tracks(&mut self, tracks: &[TrackData]) -> bool {
+        let next = track_signature(tracks);
+        let changed = self
+            .favorites_cache
+            .tracks
+            .as_deref()
+            .is_none_or(|cached| track_signature(cached) != next);
+        self.favorite_track_ids = tracks.iter().map(|t| t.track_id.clone()).collect();
+        self.favorites_cache.tracks = Some(tracks.to_vec());
+        self.favorites_cache.mark_synced(FavoritesCache::TRACKS);
+        self.favorites_cache.save();
+        changed
+    }
+
+    /// Store freshly fetched display items for `category`, returning whether
+    /// anything the tab shows changed.
+    fn store_favorite_display(
+        &mut self,
+        category: FavoritesCategory,
+        items: &[DisplayItem],
+    ) -> bool {
+        let Some(section) = Self::cache_section(category) else {
+            return false;
+        };
+        let changed = self
+            .favorites_cache
+            .set_display_items(section, items.to_vec());
+        self.favorites_cache.save();
+        changed
+    }
+
+    /// Install freshly fetched display items (see `apply_favorite_tracks`).
+    fn apply_favorite_display(
+        &mut self,
+        category: FavoritesCategory,
+        items: Vec<DisplayItem>,
+        mode: FavoritesFetch,
+    ) {
+        let changed = self.store_favorite_display(category, &items);
+        if category != self.favorites_category {
+            return;
+        }
+        match mode {
+            FavoritesFetch::Foreground | FavoritesFetch::Manual => {
+                self.favorites_loading = false;
+                self.status_msg = Some(t().fmt_loaded(items.len()));
+                self.show_favorite_items(items, !mode.is_foreground());
+            }
+            FavoritesFetch::Background => {
+                if changed {
+                    self.show_favorite_items(items, true);
+                }
+            }
+        }
+    }
+
+    /// Fetch `category` from the API. `mode` decides whether the result may
+    /// disturb what the user is looking at (see [`FavoritesFetch`]).
+    fn fetch_favorites_category(&mut self, category: FavoritesCategory, mode: FavoritesFetch) {
+        if mode.is_foreground() {
+            self.favorites_loading = true;
+        } else {
+            self.favorites_revalidating = Some(category);
+        }
+
         let client = Arc::clone(&self.client);
         let tx = self.async_tx.clone();
 
@@ -1640,10 +1862,18 @@ impl Daemon {
                     let client = client.lock().await;
                     match client.get_favorites_ordered(order).await {
                         Ok(tracks) => {
-                            let _ = tx.send(AsyncResult::FavoritesLoaded(category, tracks));
+                            let _ = tx.send(AsyncResult::FavoritesLoaded {
+                                category,
+                                tracks,
+                                mode,
+                            });
                         }
                         Err(e) => {
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1653,10 +1883,18 @@ impl Daemon {
                     let client = client.lock().await;
                     match client.get_listening_history().await {
                         Ok(tracks) => {
-                            let _ = tx.send(AsyncResult::FavoritesLoaded(category, tracks));
+                            let _ = tx.send(AsyncResult::FavoritesLoaded {
+                                category,
+                                tracks,
+                                mode,
+                            });
                         }
                         Err(e) => {
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1668,11 +1906,19 @@ impl Daemon {
                     match client.get_favorite_artists().await {
                         Ok(items) => {
                             debug!("Favorite artists loaded: {} items", items.len());
-                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded {
+                                category,
+                                items,
+                                mode,
+                            });
                         }
                         Err(e) => {
                             debug!("Favorite artists error: {e}");
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1682,10 +1928,18 @@ impl Daemon {
                     let client = client.lock().await;
                     match client.get_favorite_albums().await {
                         Ok(items) => {
-                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded {
+                                category,
+                                items,
+                                mode,
+                            });
                         }
                         Err(e) => {
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1695,10 +1949,18 @@ impl Daemon {
                     let client = client.lock().await;
                     match client.get_playlists().await {
                         Ok(items) => {
-                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded {
+                                category,
+                                items,
+                                mode,
+                            });
                         }
                         Err(e) => {
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1708,10 +1970,18 @@ impl Daemon {
                     let client = client.lock().await;
                     match client.get_following().await {
                         Ok(items) => {
-                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded {
+                                category,
+                                items,
+                                mode,
+                            });
                         }
                         Err(e) => {
-                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                            let _ = tx.send(AsyncResult::FavoritesError {
+                                category,
+                                err: e.to_string(),
+                                mode,
+                            });
                         }
                     }
                 });
@@ -1815,6 +2085,9 @@ impl Daemon {
         });
     }
 
+    /// Fetch the favorite ids that back the heart indicators, and seed the
+    /// tracks cache with the list that comes with them — this is what makes
+    /// favorites added from another device show up when the daemon starts.
     fn start_load_favorite_ids(&mut self) {
         if self.is_offline {
             return;
@@ -1823,9 +2096,11 @@ impl Daemon {
         let tx = self.async_tx.clone();
         tokio::spawn(async move {
             let client = client.lock().await;
-            let track_ids = match client.get_favorites().await {
-                Ok(tracks) => tracks.iter().map(|t| t.track_id.clone()).collect(),
-                Err(_) => Vec::new(),
+            // A failed tracks request sends nothing at all: an error must never
+            // clear every heart indicator.
+            let Ok(tracks) = client.get_favorites().await else {
+                debug!("Favorite tracks unavailable, heart indicators left as-is");
+                return;
             };
             let artist_ids = match client.get_favorite_artists().await {
                 Ok(items) => items.iter().filter_map(|d| d.artist_id.clone()).collect(),
@@ -1836,7 +2111,7 @@ impl Daemon {
                 Err(_) => Vec::new(),
             };
             let _ = tx.send(AsyncResult::FavoriteIdsLoaded {
-                track_ids,
+                tracks,
                 artist_ids,
                 album_ids,
             });
@@ -3057,56 +3332,55 @@ impl Daemon {
                     self.search_loading = false;
                     self.status_msg = Some(t().fmt_error(t().status_search_error, &err));
                 }
-                AsyncResult::FavoritesLoaded(category, tracks) => {
-                    // Cache under the category that was requested, never the one
-                    // currently displayed — a late response must not overwrite
-                    // another category's cache entry.
-                    // RecentlyPlayed is never cached (changes after every play).
-                    if category == FavoritesCategory::Tracks {
-                        self.favorites_cache.tracks = Some(tracks.clone());
-                        self.favorites_cache.save();
-                        // Backing list for favorite indicators / shuffle favorites.
-                        self.favorites = tracks.clone();
-                        self.favorite_track_ids =
-                            tracks.iter().map(|t| t.track_id.clone()).collect();
+                AsyncResult::FavoritesLoaded {
+                    category,
+                    tracks,
+                    mode,
+                } => {
+                    // Cleared for every outcome, so a late reply re-arms the
+                    // next revalidation.
+                    if self.favorites_revalidating == Some(category) {
+                        self.favorites_revalidating = None;
                     }
-                    if category == self.favorites_category {
+                    // Cache under the category that was requested, never the
+                    // one displayed — a late response must not overwrite
+                    // another category's cache entry. Recently Played is never
+                    // cached (it changes after every play).
+                    if category == FavoritesCategory::Tracks {
+                        self.apply_favorite_tracks(tracks, mode);
+                    } else if category == self.favorites_category
+                        && mode != FavoritesFetch::Background
+                    {
                         self.favorites_loading = false;
                         self.status_msg = Some(t().fmt_loaded(tracks.len()));
-                        self.favorites_display =
-                            tracks.iter().map(DisplayItem::from_track).collect();
-                        self.favorites = tracks;
-                        self.favorites_selected = 0;
+                        // A manual refresh (R key) keeps the focused row in place.
+                        self.show_favorite_tracks(tracks, mode == FavoritesFetch::Manual);
                     }
                 }
-                AsyncResult::FavoritesDisplayLoaded(category, items) => {
-                    // Cache under the requested category (see FavoritesLoaded).
-                    match category {
-                        FavoritesCategory::Artists => {
-                            self.favorites_cache.artists = Some(items.clone());
-                        }
-                        FavoritesCategory::Albums => {
-                            self.favorites_cache.albums = Some(items.clone());
-                        }
-                        FavoritesCategory::Playlists => {
-                            self.favorites_cache.playlists = Some(items.clone());
-                        }
-                        FavoritesCategory::Following => {
-                            self.favorites_cache.following = Some(items.clone());
-                        }
-                        _ => {}
+                AsyncResult::FavoritesDisplayLoaded {
+                    category,
+                    items,
+                    mode,
+                } => {
+                    if self.favorites_revalidating == Some(category) {
+                        self.favorites_revalidating = None;
                     }
-                    self.favorites_cache.save();
-                    if category == self.favorites_category {
-                        self.favorites_loading = false;
-                        self.status_msg = Some(t().fmt_loaded(items.len()));
-                        self.favorites.clear();
-                        self.favorites_display = items;
-                        self.favorites_selected = 0;
-                    }
+                    self.apply_favorite_display(category, items, mode);
                 }
-                AsyncResult::FavoritesError(category, err) => {
-                    if category == self.favorites_category {
+                AsyncResult::FavoritesError {
+                    category,
+                    err,
+                    mode,
+                } => {
+                    if self.favorites_revalidating == Some(category) {
+                        self.favorites_revalidating = None;
+                    }
+                    if mode == FavoritesFetch::Background {
+                        // A silent revalidation must never wipe the list the
+                        // user is looking at: the cached copy stays until the
+                        // next attempt.
+                        debug!("Favorites revalidation failed for {category:?}: {err}");
+                    } else if category == self.favorites_category {
                         self.favorites_loading = false;
                         self.favorites_display.clear();
                         self.favorites.clear();
@@ -3172,15 +3446,23 @@ impl Daemon {
                     self.status_msg = Some(t().fmt_error(t().status_favorite_error, &err));
                 }
                 AsyncResult::FavoriteIdsLoaded {
-                    track_ids,
+                    tracks,
                     artist_ids,
                     album_ids,
                 } => {
-                    if !track_ids.is_empty() {
-                        self.favorite_track_ids = track_ids;
-                    }
+                    // Seed the tracks cache and the heart indicators from the API.
+                    // This runs at login regardless of the cache TTL, so favorites
+                    // added elsewhere (web player, mobile app) are picked up even
+                    // if the TUI was closed or idle when they were made.
+                    let mut tracks = tracks;
+                    deezer_core::sort::tracks_by_date(&mut tracks, self.config.sort_order);
+                    let changed = self.store_favorite_tracks(&tracks);
                     self.favorite_artist_ids = artist_ids;
                     self.favorite_album_ids = album_ids;
+                    if changed && self.favorites_category == FavoritesCategory::Tracks {
+                        self.favorites_loading = false;
+                        self.show_favorite_tracks(tracks, true);
+                    }
                 }
                 AsyncResult::PlaylistsReady(playlists) => {
                     self.playlists = playlists;

@@ -47,8 +47,8 @@ pub enum Command {
     ToggleShuffle,
     /// Cycle repeat mode (Off -> Queue -> Track -> Off).
     CycleRepeat,
-    /// Load favorites from Deezer.
-    LoadFavorites,
+    /// Force-refresh the current favorites category from Deezer.
+    RefreshFavorites,
     /// Navigate list selection up.
     SelectUp,
     /// Navigate list selection down.
